@@ -27,7 +27,8 @@ fail where `ps` cannot run, such as inside a sandbox; `nix flake check`
 provides it. The `geas ssh` tests sign certificates with a real
 `ssh-keygen`, which must be on `PATH`.
 
-CI runs `nix flake check` on Linux and macOS with Go from nixpkgs-unstable.
+CI runs `nix flake check` with Go from nixpkgs-unstable: Radicle CI on
+`x86_64-linux` (`.radicle/native.yaml`), and GitHub Actions on Linux and macOS.
 
 ## What the tests cover
 

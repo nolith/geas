@@ -1,0 +1,5 @@
+shell: |
+  set -e
+  nix flake check -L
+  nix build -L
+  ./result/bin/geas --help
