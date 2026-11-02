@@ -91,6 +91,7 @@
           meta = {
             description = "Launch AI agents with short-lived GitHub and GitLab credentials";
             homepage = "https://github.com/nolith/geas";
+            license = lib.licenses.gpl3Plus;
             mainProgram = "geas";
             platforms = lib.platforms.linux ++ lib.platforms.darwin;
           };

@@ -121,3 +121,8 @@ nix flake check -L   # formatting, vet, race-enabled tests and the build
 
 See [Development](docs/development.md) for the plain Go commands and the
 test suite.
+
+## License
+
+geas is free software, licensed under the GNU General Public License,
+version 3 or any later version (GPL-3.0-or-later). See [LICENSE](LICENSE).
