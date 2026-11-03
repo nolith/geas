@@ -367,7 +367,7 @@ func keygenListing(t *testing.T, path string) string {
 func TestShowAndDrop(t *testing.T) {
 	ssh, out, _ := tool(t)
 	ctx := context.Background()
-	if code, err := ssh.Run(ctx, []string{"show"}); code != 0 || err != nil || out.String() != "no agent has a key\n" {
+	if code, err := ssh.Run(ctx, []string{"show"}); code != 0 || err != nil || out.String() != "no agent has a key or a session\n" {
 		t.Fatal(code, err, out)
 	}
 	valid, _ := AgentDir("claude-valid")

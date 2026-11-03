@@ -56,8 +56,10 @@ Commands:
                     plugged in, or the one --ca names. Asks for its FIDO2 PIN
                     and a touch: run it yourself, at your terminal
   show [AGENT]      The certificate's key ID, serial, validity and principals;
-                    without AGENT, every agent with a key
-  drop AGENT        Delete AGENT's key and certificate
+                    without AGENT, every agent with a key or a session, and
+                    where that session runs
+  drop AGENT        Delete AGENT's key and certificate; a running session
+                    keeps the name until it ends
   enroll YK-NAME    Create an agent CA on the one YubiKey plugged in, once per
                     YubiKey, and print its serial, public key and handle path
   list-cas          The agent CAs this machine knows, and which are plugged in

@@ -129,8 +129,9 @@ func showSession(output io.Writer, name string) error {
 	return err
 }
 
-// list prints every agent with a key, one line each: its name, and until
-// when its certificate is valid and for which hosts.
+// list prints every agent with a key or a session's reservation, one line
+// each: its name, until when its certificate is valid and for which hosts,
+// and for a reserved name, where its session runs, or ran.
 func list(output io.Writer, now time.Time) error {
 	agents, err := AgentsDir()
 	if err != nil {
@@ -142,28 +143,53 @@ func list(output io.Writer, now time.Time) error {
 	}
 	var names []string
 	for _, e := range entries {
-		if _, err := os.Stat(filepath.Join(agents, e.Name(), KeyFile)); err == nil && e.IsDir() && agentName.MatchString(e.Name()) {
-			names = append(names, e.Name())
+		if !e.IsDir() || !agentName.MatchString(e.Name()) {
+			continue
+		}
+		for _, file := range []string{KeyFile, OwnerFile} {
+			if _, err := os.Stat(filepath.Join(agents, e.Name(), file)); err == nil {
+				names = append(names, e.Name())
+				break
+			}
 		}
 	}
 	if len(names) == 0 {
-		_, err = fmt.Fprintln(output, "no agent has a key")
+		_, err = fmt.Fprintln(output, "no agent has a key or a session")
 		return err
 	}
 	width := 0
 	for _, name := range names {
 		width = max(width, len(name))
 	}
+	home, _ := os.UserHomeDir()
 	for _, name := range names {
-		state := "no certificate"
+		state := "no key yet"
+		if _, err := os.Stat(filepath.Join(agents, name, KeyFile)); err == nil {
+			state = "no certificate"
+		}
 		if raw, err := os.ReadFile(filepath.Join(agents, name, CertificateFile)); err == nil {
 			state = summary(raw, now)
+		}
+		if o, err := ReadOwner(name); err == nil {
+			state += " (" + o.describe(home) + ")"
 		}
 		if _, err = fmt.Fprintf(output, "%-*s  %s\n", width, name, state); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// describe is where o's session runs, or ran, with home as ~.
+func (o Owner) describe(home string) string {
+	dir := o.Dir
+	if home != "" && (dir == home || strings.HasPrefix(dir, home+"/")) {
+		dir = "~" + dir[len(home):]
+	}
+	if o.Ended() {
+		return "ended session in " + dir
+	}
+	return "session in " + dir
 }
 
 // summary is one line about a certificate: until when it is valid, or since
@@ -185,7 +211,11 @@ func summary(raw []byte, now time.Time) string {
 	return state + ": " + strings.Join(c.Principals, " ")
 }
 
-// drop deletes the agent's key and certificate, and its directory.
+// drop deletes the agent's key and certificate, and its directory. The
+// directory of a name a running session reserved stays, with nothing in it
+// but its owner, so that the name is not given to another agent: the
+// session sees its certificate gone, and removes the directory when it
+// ends.
 func drop(output io.Writer, name string) error {
 	dir, err := AgentDir(name)
 	if err != nil {
@@ -194,10 +224,25 @@ func drop(output io.Writer, name string) error {
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return errors.New(name + " has nothing to drop")
 	}
+	o, err := ReadOwner(name)
+	running := err == nil && !o.Ended()
+	dropped := false
 	for _, file := range []string{KeyFile, PublicKeyFile, CertificateFile} {
-		if err = os.Remove(filepath.Join(dir, file)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		err = os.Remove(filepath.Join(dir, file))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		dropped = dropped || err == nil
+	}
+	if running {
+		if !dropped {
+			return errors.New(name + " has no key to drop: its session removes the name when it ends")
+		}
+		_, err = fmt.Fprintf(output, "Dropped the key and certificate of %s; its session removes the name when it ends.\n", name)
+		return err
+	}
+	if err = os.Remove(filepath.Join(dir, OwnerFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	if err = os.Remove(dir); err != nil {
 		return err
