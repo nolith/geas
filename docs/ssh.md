@@ -8,23 +8,60 @@ and a touch, at your terminal.
 ```bash
 geas ssh enroll yk-blue                           # once per YubiKey
 geas ssh list-cas                                 # the agent CAs, and which are plugged in
-geas ssh name claude                              # the agent's name, claude-<workspace>
-geas ssh grant claude-myproject transcoder --for 2h
-geas ssh show claude-myproject                    # key ID, serial, validity, principals
-geas ssh show                                     # every agent with a key
-geas ssh drop claude-myproject                    # delete its key and certificate
+geas ssh show                                     # every agent with a key or a session
+geas ssh grant claude-myproject-k3x9q2mz transcoder --for 2h
+geas ssh show claude-myproject-k3x9q2mz           # key ID, serial, validity, principals
+geas ssh drop claude-myproject-k3x9q2mz           # delete its key and certificate
 ```
 
 ## Agent names
 
-An agent's name is `<tool>-<workspace>`: the tool, such as `claude` or
-`opencode`, and the name of the terminal multiplexer workspace it runs in,
-as the `herdr` CLI reports it, in lower case with dashes.
-`geas ssh name TOOL` prints it.
+Each session names its agent when it starts, with a name no other agent
+has: `<tool>-<directory>-<random>`, such as
+`opencode-geas-session-names-k3x9q2mz`.
 
-When `AGENT_SSH_NAME` already names an agent of that tool, that is the
-name, and `herdr`, which a sandbox may keep out of reach, is not needed.
-`geas ssh name` alone prints `AGENT_SSH_NAME`.
+- The tool is the base name of the first word after `geas run --`, such as
+  `claude` or `opencode`.
+- The directory is the base name of the directory the session starts in,
+  in lower case with dashes, cut at a dash to at most 24 characters, and
+  left out when nothing of it is usable, as for `/`. It only helps you
+  recognise the agent; `geas ssh show` prints the whole directory.
+- The random part is 8 characters of
+  [Crockford's base32](https://www.crockford.com/base32.html), without `i`,
+  `l`, `o` and `u`, which read like other characters: 40 random bits.
+
+Sessions in the same directory with the same tool, and the several agent
+tabs of one terminal session, get names of their own: nothing about the
+name comes from a terminal multiplexer. The session reserves its name
+before the harness starts, by creating the agent's directory,
+`$XDG_STATE_HOME/geas/agents/<name>`, with a `session.json` in it that
+names the session, the tool and the directory. The directory appears
+whole, and a name that has a directory already is never taken over: the
+session draws another. A name is never given to two agents, and with 40
+random bits, one is practically never drawn again while a certificate
+granted to its earlier holder may still be valid.
+
+The harness gets the name as `AGENT_SSH_NAME`. Since the name cannot be
+known before the session starts, the agent tells you, with the exact
+command to run, when it needs a grant; `geas ssh show` lists the reserved
+names, with the directory each session runs in. Inside a session,
+`geas ssh name` prints `AGENT_SSH_NAME`, and `geas ssh name TOOL` prints it
+when it is `TOOL`'s. Outside one, `geas ssh name TOOL` fails, saying where
+names come from.
+
+When the session ends, it removes the agent's directory, its key and its
+certificate, and the copies in the session directory. Should the launcher
+die, by SIGKILL as when a terminal closes a pane, the reaper removes them;
+see [Sessions](sessions.md).
+
+### Pinned names
+
+When `AGENT_SSH_NAME` already names an agent of the harness's tool, such as
+`AGENT_SSH_NAME=claude-myproject geas run -- claude`, that is the agent's
+name: the session reserves nothing, uses the name as it is, and removes
+nothing at its end. The same goes for a session started inside another one,
+which inherits its `AGENT_SSH_NAME`. `geas ssh grant` works on any name,
+reserved or not, and creates the agent's directory when there is none.
 
 ## Granting access
 
@@ -51,6 +88,32 @@ name, and `herdr`, which a sandbox may keep out of reach, is not needed.
 The key alone opens nothing on a host that accepts only certificates for
 `agent`: what limits an agent is its certificate's lifetime, at most 12
 hours. `geas ssh drop` deletes both.
+
+## Listing and dropping agents
+
+`geas ssh show` without a name lists every agent with a key or a session's
+reservation, one line each: its certificate's validity and principals, or
+`no certificate` or `no key yet`, and for a reserved name, where its
+session runs, or `ended session` when that session's directory is gone:
+
+```console
+$ geas ssh show
+claude-myproject                      until 2026-11-03 18:00 CET: host:transcoder
+opencode-geas-session-names-k3x9q2mz  no key yet (session in ~/src/geas-session-names)
+```
+
+`geas ssh drop AGENT` deletes the agent's key and certificate. While the
+session that reserved the name runs, the directory stays, with nothing but
+its `session.json`, so that the name cannot go to another agent: the
+session sees its certificate gone, as below, a new grant of the name
+reaches it again, and its end removes the directory. Any other agent's
+directory goes with its key.
+
+A session that dies with its reaper, as at a power loss, leaves its
+session directory and its agent's. Its certificate stops working within 12
+hours, and nothing else uses the name: remove the session directory, under
+`$XDG_STATE_HOME/geas/sessions`, and `geas ssh drop` then removes the
+agent's directory too.
 
 ## Agent CAs
 
@@ -79,10 +142,9 @@ session.
 ## In a session
 
 With `{ "type": "ssh" }` among the providers, a session names its agent
-when it starts: the tool is the base name of the first word after
-`geas run --`, and the name is found as `geas ssh name` finds it, outside
-the sandbox. The harness gets it as `AGENT_SSH_NAME`. When there is no
-name, the provider fails, and the session starts all the same.
+when it starts, as in [Agent names](#agent-names), outside the sandbox. The
+harness gets it as `AGENT_SSH_NAME`. When there is no name, the provider
+fails, and the session starts all the same.
 
 Once the harness runs, the provider checks that the agent has a key and a
 certificate valid now, and copies both into the session directory with an
@@ -111,8 +173,8 @@ when one changed:
   the session's copies and `ssh/config` go, and the marker turns `failed`
   again.
 
-There is nothing to revoke: a certificate expires on its own, within 12
-hours.
+A certificate cannot be revoked, and expires on its own, within 12 hours;
+the session's end removes the key it is for, unless the name is pinned.
 
 Inside a session, `geas ssh show` and `geas ssh show <its own name>` read
 the session's copy, since a sandbox keeps the agents' directory out of

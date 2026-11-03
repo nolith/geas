@@ -21,7 +21,7 @@ The harness inherits geas's environment without `GH_TOKEN`,
 | `GLAB_CONFIG_DIR`                        | `$GEAS_SESSION_DIR/glab`                                                        | GitLab      |
 | `GH_CONFIG_DIR`                          | `$GEAS_SESSION_DIR/gh`                                                          | GitHub      |
 | `GH_PROMPT_DISABLED`                     | `1`                                                                             | GitHub      |
-| `AGENT_SSH_NAME`                         | `claude-myproject`, the agent's SSH name                                        | SSH         |
+| `AGENT_SSH_NAME`                         | `claude-myproject-k3x9q2mz`, the agent's SSH name                               | SSH         |
 
 `PATH` is unchanged. The Nix package puts `ssh-keygen`, `ykman` and
 `fido2-token` first on geas's own `PATH`, and saves yours first in

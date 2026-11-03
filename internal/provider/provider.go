@@ -168,6 +168,16 @@ type Settler interface {
 	Settle(ctx context.Context, l *ledger.Ledger) error
 }
 
+// A Reserver claims, before the harness starts, something the harness is
+// told about, such as the SSH agent's name: the session calls Reserve once
+// the ledger and the reaper exist, then reads Setup again. Reserve records
+// what it creates in the ledger before it creates it, and Revoke undoes
+// it with the rest. A Reserve that fails leaves the provider failed, and
+// the session starts all the same.
+type Reserver interface {
+	Reserve(l *ledger.Ledger) error
+}
+
 // A Watcher's credential comes and goes from outside the session, such as
 // an SSH certificate the human grants while the agent runs. The session
 // calls Watch after Acquire, whether Acquire failed or not, and again after

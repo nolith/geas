@@ -23,7 +23,6 @@ func tool(t *testing.T) (*Tool, *bytes.Buffer, *bytes.Buffer) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GEAS_SESSION_DIR", "")
 	t.Setenv("AGENT_SSH_NAME", "")
-	t.Setenv("HERDR_WORKSPACE_ID", "")
 	var out, errs bytes.Buffer
 	return &Tool{
 		Stdout:    &out,
@@ -72,34 +71,22 @@ func TestSlug(t *testing.T) {
 }
 
 func TestName(t *testing.T) {
-	ctx := context.Background()
-	herdr := `[ "$1 $2 $3" = "workspace get w7" ] || exit 2
-echo '{"result":{"workspace":{"id":"w7","label":"Phase 7!"}}}'
-`
+	outside := "AGENT_SSH_NAME names no agent of claude: each session names its agent when it starts, claude-<directory>-<random>, and sets AGENT_SSH_NAME; geas ssh show lists the names sessions hold"
 	cases := []struct {
-		name, tool, known, workspace, herdr, want, err string
+		name, tool, known, want, err string
 	}{
-		{name: "from herdr", tool: "claude", workspace: "w7", herdr: herdr, want: "claude-phase-7"},
-		{name: "a session's name needs no herdr", tool: "claude", known: "claude-phase7", workspace: "w7", want: "claude-phase7"},
+		{name: "the session's name", tool: "claude", known: "claude-geas-k3x9q2mz", want: "claude-geas-k3x9q2mz"},
+		{name: "a pinned name", tool: "claude", known: "Claude-Phase7", want: "claude-phase7"},
 		{name: "the session's name without a tool", known: "Claude-Phase7", want: "claude-phase7"},
-		{name: "another tool's name asks herdr", tool: "opencode", known: "claude-phase7", workspace: "w7", herdr: herdr, want: "opencode-phase-7"},
-		{name: "herdr unreachable", tool: "claude", workspace: "w7", herdr: "echo 'ping refused' >&2; exit 1\n", err: "cannot ask herdr for the workspace's label"},
-		{name: "no herdr", tool: "claude", workspace: "w7", err: "herdr not found, and AGENT_SSH_NAME names no agent of this tool"},
-		{name: "no workspace", tool: "claude", herdr: herdr, err: "not in a herdr workspace, and AGENT_SSH_NAME names no agent of this tool"},
-		{name: "no label", tool: "claude", workspace: "w7", herdr: `echo '{"result":{"workspace":{"label":"!!"}}}'` + "\n", err: "the herdr workspace has no usable label"},
-		{name: "bad tool", tool: "Claude", workspace: "w7", herdr: herdr, err: "bad tool name: Claude"},
+		{name: "outside a session", tool: "claude", err: outside},
+		{name: "another tool's session", tool: "claude", known: "opencode-geas-k3x9q2mz", err: outside},
+		{name: "bad tool", tool: "Claude", known: "claude-phase7", err: "bad tool name: Claude"},
 		{name: "nothing", err: "no agent: give a <tool>, or run inside a geas session"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// A PATH without any herdr, unless the case fakes one.
-			t.Setenv("PATH", t.TempDir())
-			if c.herdr != "" {
-				testutil.Executable(t, "herdr", c.herdr)
-			}
 			t.Setenv("AGENT_SSH_NAME", c.known)
-			t.Setenv("HERDR_WORKSPACE_ID", c.workspace)
-			got, err := Name(ctx, c.tool)
+			got, err := Name(c.tool)
 			if c.err != "" {
 				if err == nil || err.Error() != c.err {
 					t.Fatalf("got %q, %v; want error %q", got, err, c.err)
@@ -113,15 +100,55 @@ echo '{"result":{"workspace":{"id":"w7","label":"Phase 7!"}}}'
 	}
 }
 
+// Every name is new, a slug, and made of the tool, the directory and 8
+// random characters.
+func TestNewName(t *testing.T) {
+	shape := regexp.MustCompile(`^opencode-geas-session-names-[0-9a-hjkmnp-tv-z]{8}$`)
+	seen := map[string]bool{}
+	for range 1000 {
+		name, err := NewName("opencode", "/Users/nolith/src/geas-session-names")
+		if err != nil || !shape.MatchString(name) || !agentName.MatchString(name) || seen[name] {
+			t.Fatalf("%q %v", name, err)
+		}
+		seen[name] = true
+	}
+	for dir, want := range map[string]string{
+		"/":        `^pi-[0-9a-z]{8}$`,
+		"":         `^pi-[0-9a-z]{8}$`,
+		"/src/!!!": `^pi-[0-9a-z]{8}$`,
+		"/src/A Very Long Checkout Name For Work": `^pi-a-very-long-checkout-[0-9a-z]{8}$`,
+		"/src/abcdefghijklmnopqrstuvw-xyz":        `^pi-abcdefghijklmnopqrstuvw-[0-9a-z]{8}$`,
+		"/src/abcdefghijklmnopqrstuvwxyz":         `^pi-abcdefghijklmnopqrstuvwx-[0-9a-z]{8}$`,
+	} {
+		name, err := NewName("pi", dir)
+		if err != nil || !regexp.MustCompile(want).MatchString(name) || !agentName.MatchString(name) {
+			t.Errorf("NewName(pi, %q) = %q, %v; want %s", dir, name, err, want)
+		}
+	}
+	for _, bad := range []string{"", "Claude", "-pi", "python3.12"} {
+		if _, err := NewName(bad, "/src"); err == nil || err.Error() != "bad tool name: "+bad {
+			t.Errorf("NewName(%q): %v", bad, err)
+		}
+	}
+}
+
 func TestNameCommand(t *testing.T) {
 	ssh, out, _ := tool(t)
+	ctx := context.Background()
+	// Outside a session, there is no name to print yet.
+	if code, err := ssh.Run(ctx, []string{"name", "claude"}); code != 1 || err == nil || !strings.HasPrefix(err.Error(), "AGENT_SSH_NAME names no agent of claude: each session names its agent when it starts") {
+		t.Fatalf("%d %v", code, err)
+	}
 	t.Setenv("AGENT_SSH_NAME", "claude-phase7")
 	// Inside a session too.
 	t.Setenv("GEAS_SESSION_DIR", "/somewhere")
-	if code, err := ssh.Run(context.Background(), []string{"name"}); code != 0 || err != nil || out.String() != "claude-phase7\n" {
-		t.Fatalf("%d %v %q", code, err, out.String())
+	for _, args := range [][]string{{"name"}, {"name", "claude"}} {
+		out.Reset()
+		if code, err := ssh.Run(ctx, args); code != 0 || err != nil || out.String() != "claude-phase7\n" {
+			t.Fatalf("%v: %d %v %q", args, code, err, out.String())
+		}
 	}
-	if code, err := ssh.Run(context.Background(), []string{"name", "a", "b"}); code != 2 || err == nil {
+	if code, err := ssh.Run(ctx, []string{"name", "a", "b"}); code != 2 || err == nil {
 		t.Fatalf("%d %v", code, err)
 	}
 }

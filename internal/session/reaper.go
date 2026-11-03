@@ -17,6 +17,7 @@ import (
 	"github.com/nolith/geas/internal/procenv"
 	"github.com/nolith/geas/internal/provider/github"
 	"github.com/nolith/geas/internal/provider/gitlab"
+	"github.com/nolith/geas/internal/provider/sshcert"
 	"github.com/nolith/geas/internal/secretfile"
 	"github.com/nolith/geas/internal/sessiondir"
 	"github.com/nolith/geas/internal/timing"
@@ -103,9 +104,11 @@ func RunReaper(ctx context.Context, args []string) error {
 // revokers builds, from the configuration alone, every provider an entry may
 // name, by ID. One that cannot be prepared, such as a GitLab instance whose
 // issuer file is unreadable, is left out, and unprepared says why, by ID: it
-// matters only if the ledger lists something for it.
-func revokers(settings config.Config) (providers map[string]ledger.Revoker, unprepared map[string]error) {
-	providers, unprepared = map[string]ledger.Revoker{}, map[string]error{}
+// matters only if the ledger lists something for it. The SSH agent's name
+// is removed whatever the configuration says now: it needs nothing but the
+// session's ID.
+func revokers(settings config.Config, sessionID string) (providers map[string]ledger.Revoker, unprepared map[string]error) {
+	providers, unprepared = map[string]ledger.Revoker{sshcert.ID: sshcert.NewRevoker(sessionID)}, map[string]error{}
 	for _, c := range settings.GitLab {
 		gl, err := gitlab.New(c, settings.Duration(), api.New(), nil)
 		if err != nil {
@@ -151,7 +154,7 @@ func watch(ctx context.Context, launcher io.Reader, configPath, sessionID string
 	}
 	// An issuer that cannot be prepared matters only if the ledger lists
 	// something for it to revoke; the directory goes either way.
-	providers, unprepared := revokers(settings)
+	providers, unprepared := revokers(settings, sessionID)
 	message, _ := io.ReadAll(io.LimitReader(launcher, int64(len(reaperDone))+1))
 	if string(message) == reaperDone {
 		return nil
@@ -228,6 +231,12 @@ func watch(ctx context.Context, launcher io.Reader, configPath, sessionID string
 		}
 	}
 	for _, e := range pending {
+		if e.Provider == sshcert.ID {
+			// The session's directory stays, and with it the name's
+			// reservation, which geas ssh drop keeps while it does.
+			entryf(e, "giving up; remove the session directory, then run geas ssh drop %s", e.Name)
+			continue
+		}
 		entryf(e, "giving up; the PAT expires at its configured UTC date")
 	}
 	book.Close()

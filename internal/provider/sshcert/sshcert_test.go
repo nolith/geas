@@ -13,6 +13,7 @@ import (
 
 	"github.com/nolith/geas/internal/ledger"
 	"github.com/nolith/geas/internal/provider"
+	"github.com/nolith/geas/internal/sessiondir"
 	"github.com/nolith/geas/internal/sshgrant"
 	"github.com/nolith/geas/internal/testutil"
 )
@@ -23,7 +24,7 @@ func agent(t *testing.T) (*Provider, string) {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv("AGENT_SSH_NAME", "claude-test")
-	p, err := New(context.Background(), []string{"/opt/bin/claude", "--resume"})
+	p, err := New([]string{"/opt/bin/claude", "--resume"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,18 +42,20 @@ func TestSetup(t *testing.T) {
 	if p.ID() != "ssh" || p.Kind() != "ssh" || p.Name != "claude-test" || len(s.Env) != 1 || s.Env["AGENT_SSH_NAME"] != "claude-test" || len(s.Git) != 0 || !slices.Equal(s.Protect, []string{filepath.Dir(dir)}) {
 		t.Fatalf("%+v %+v", p, s)
 	}
+	// A pinned name is the human's: there is nothing to reserve.
+	if err := p.Reserve(nil); err != nil || p.Name != "claude-test" {
+		t.Fatal(err)
+	}
 	// Without a name, the provider still protects every agent's key, and
 	// exports nothing.
-	t.Setenv("AGENT_SSH_NAME", "")
-	t.Setenv("HERDR_WORKSPACE_ID", "")
-	p, err := New(context.Background(), []string{"claude"})
-	if err == nil || err.Error() != "not in a herdr workspace, and AGENT_SSH_NAME names no agent of this tool" {
+	p, err := New([]string{"/opt/bin/Claude"})
+	if err == nil || err.Error() != "bad tool name: Claude" {
 		t.Fatal(err)
 	}
 	if s = p.Setup(); len(s.Env) != 0 || !slices.Equal(s.Protect, []string{filepath.Dir(dir)}) {
 		t.Fatalf("%+v", s)
 	}
-	if _, err = New(context.Background(), nil); err == nil {
+	if _, err = New(nil); err == nil {
 		t.Fatal("named an agent without a harness")
 	}
 }
@@ -104,8 +107,8 @@ func TestAcquire(t *testing.T) {
 	if _, err := p.Acquire(ctx, nil); err == nil || err.Error() != "claude-test has no certificate yet"+ask {
 		t.Fatal(err)
 	}
-	if err := p.Revoke(ctx, ledger.Entry{Provider: "ssh"}); !errors.Is(err, ledger.ErrGone) {
-		t.Fatalf("revoked a certificate: %v", err)
+	if err := p.Revoke(ctx, ledger.Entry{Provider: "ssh", Name: "claude-test"}); !errors.Is(err, ledger.ErrGone) || !exists(filepath.Join(dir, sshgrant.KeyFile)) {
+		t.Fatalf("revoked a pinned agent: %v", err)
 	}
 }
 
@@ -242,5 +245,174 @@ func TestRenderer(t *testing.T) {
 	}
 	if _, err := quote("/a\"b"); err == nil {
 		t.Fatal("quoted a double quote")
+	}
+}
+
+func exists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+// session is a new session's ledger, under the state directory the test
+// set, and the provider of an opencode agent in work, the directory the
+// test is in.
+func session(t *testing.T, work string) (*Provider, *ledger.Ledger) {
+	t.Helper()
+	id, err := sessiondir.NewID(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := sessiondir.Create(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	book, err := ledger.Create(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { book.Close() })
+	t.Setenv("AGENT_SSH_NAME", "")
+	// New reads the working directory; testing.T.Chdir needs Go 1.24.
+	previous, err := os.Getwd()
+	if err != nil || os.Chdir(work) != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(previous) })
+	p, err := New([]string{"/usr/local/bin/opencode", "--continue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p, book
+}
+
+// checkout is a new state directory, and a directory to start sessions in.
+func checkout(t *testing.T) string {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	work := filepath.Join(t.TempDir(), "geas-session-names")
+	if err := os.Mkdir(work, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// As os.Getwd reports it, through any symlink in the temporary path.
+	work, err := filepath.EvalSymlinks(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return work
+}
+
+// Each session reserves a name of its own, which Revoke removes with the
+// session's copies, for that session only.
+func TestReserve(t *testing.T) {
+	work := checkout(t)
+	p, book := session(t, work)
+	drawn := p.Name
+	if err := p.Reserve(book); err != nil || p.Name != drawn || !strings.HasPrefix(p.Name, "opencode-geas-session-names-") || p.Setup().Env["AGENT_SSH_NAME"] != p.Name {
+		t.Fatalf("%q %v", p.Name, err)
+	}
+	owner, err := sshgrant.ReadOwner(p.Name)
+	if err != nil || owner != (sshgrant.Owner{Session: book.ID(), Tool: "opencode", Dir: work}) {
+		t.Fatalf("%+v %v", owner, err)
+	}
+	entries, err := book.Entries()
+	if err != nil || len(entries) != 1 || entries[0].Provider != "ssh" || entries[0].Name != p.Name || entries[0].Revoked {
+		t.Fatalf("%+v %v", entries, err)
+	}
+	// Sessions of the same tool, in the same directory, get names of
+	// their own.
+	names := map[string]bool{p.Name: true}
+	var others []*Provider
+	var otherBooks []*ledger.Ledger
+	for range 10 {
+		other, otherBook := session(t, work)
+		if err = other.Reserve(otherBook); err != nil || names[other.Name] {
+			t.Fatalf("%q %v", other.Name, err)
+		}
+		names[other.Name] = true
+		others, otherBooks = append(others, other), append(otherBooks, otherBook)
+	}
+
+	// The grant arrives, and the session holds its copies.
+	dir, _ := sshgrant.AgentDir(p.Name)
+	testutil.SSHCertificate(t, dir, "-5m:+2h", "host:transcoder")
+	c, err := p.Acquire(context.Background(), book)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copies, err := sessiondir.Open(book.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rel, raw := range c.Files {
+		copies.WriteFile(rel, raw)
+	}
+	if err = (Renderer{}).Render(copies, map[string]provider.Credential{ID: c}); err != nil {
+		t.Fatal(err)
+	}
+	// Another session cannot remove it; this one can, and does.
+	if err = others[0].Revoke(context.Background(), entries[0]); !errors.Is(err, ledger.ErrGone) || !exists(filepath.Join(dir, sshgrant.KeyFile)) {
+		t.Fatal(err)
+	}
+	if err = p.Revoke(context.Background(), entries[0]); err != nil || exists(dir) {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{sshgrant.SessionKey, sshgrant.SessionCertificate, sshgrant.SessionConfig} {
+		if _, err = copies.ReadFile(rel); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s left: %v", rel, err)
+		}
+	}
+	// As does the reaper, with nothing but the session's ID, and again.
+	otherEntries, _ := otherBooks[0].Entries()
+	revoker := NewRevoker(otherBooks[0].ID())
+	if err = revoker.Revoke(context.Background(), otherEntries[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err = revoker.Revoke(context.Background(), otherEntries[0]); !errors.Is(err, ledger.ErrGone) {
+		t.Fatal(err)
+	}
+	if other, _ := sshgrant.AgentDir(others[0].Name); exists(other) {
+		t.Fatal("the reaper left the agent's directory")
+	}
+}
+
+// A name that is taken is closed in the ledger, never removed, and
+// replaced by a new one.
+func TestReserveCollision(t *testing.T) {
+	p, book := session(t, checkout(t))
+	taken := p.Name
+	dir, _ := sshgrant.AgentDir(taken)
+	testutil.SSHCertificate(t, dir, "-5m:+2h", "host:transcoder")
+	if err := p.Reserve(book); err != nil || p.Name == taken || !strings.HasPrefix(p.Name, "opencode-geas-session-names-") {
+		t.Fatalf("%q %v", p.Name, err)
+	}
+	open, err := book.Unrevoked()
+	if err != nil || len(open) != 1 || open[0].Name != p.Name {
+		t.Fatalf("%+v %v", open, err)
+	}
+	all, _ := book.Entries()
+	if len(all) != 2 || all[0].Name != taken || !all[0].Revoked {
+		t.Fatalf("%+v", all)
+	}
+	// Even an entry that names the agent that held the name leaves it.
+	if err = p.Revoke(context.Background(), all[0]); !errors.Is(err, ledger.ErrGone) || !exists(filepath.Join(dir, sshgrant.KeyFile)) {
+		t.Fatal(err)
+	}
+}
+
+// A session that cannot reserve a name starts without one.
+func TestReserveFails(t *testing.T) {
+	p, book := session(t, checkout(t))
+	agents, _ := sshgrant.AgentsDir()
+	if err := os.WriteFile(agents, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Reserve(book); err == nil || p.Name != "" || len(p.Setup().Env) != 0 {
+		t.Fatalf("%q %v", p.Name, err)
+	}
+	// What it recorded is closed by revoking it, and nothing else goes.
+	open, _ := book.Unrevoked()
+	results := book.Revoke(context.Background(), open, map[string]ledger.Revoker{ID: p})
+	if len(results) != 1 || results[0].Err != nil && !errors.Is(results[0].Err, ledger.ErrGone) || !exists(agents) {
+		t.Fatalf("%+v", results)
 	}
 }

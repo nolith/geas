@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -888,8 +889,8 @@ until grep -qs ready "$GEAS_SESSION_DIR/markers/ssh"; do sleep 0.05; done
 "$GEAS_TEST_BINARY" ssh show | grep -A1 Principals
 grep -c agents "$GEAS_SESSION_DIR/sandbox/policy.json"
 cd "$GEAS_SESSION_DIR/ssh" && ls -l id_ed25519 id_ed25519-cert.pub config | cut -c1-10`
-	// The harness is /bin/sh, so the agent is sh-<workspace>, and the name
-	// the launcher inherits needs no herdr.
+	// The harness is /bin/sh, so AGENT_SSH_NAME=sh-test pins the agent of
+	// its tool, sh.
 	s := launchConfig(t, config.Config{SessionHours: 1, SSH: true}, script, "AGENT_SSH_NAME=sh-test")
 	deadline := time.Now().Add(20 * time.Second)
 	for _, err := os.Stat(filepath.Join(signal, "failed")); err != nil; _, err = os.Stat(filepath.Join(signal, "failed")) {
@@ -912,5 +913,117 @@ cd "$GEAS_SESSION_DIR/ssh" && ls -l id_ed25519 id_ed25519-cert.pub config | cut 
 		if !strings.Contains(string(output), want) {
 			t.Errorf("output lacks %q:\n%s", want, output)
 		}
+	}
+	// A pinned name is the human's: the session leaves it as it was.
+	if strings.Contains(string(output), " removed.") {
+		t.Errorf("removed a pinned agent:\n%s", output)
+	}
+	agent := filepath.Join(s.state, "geas", "agents", "sh-test")
+	for _, file := range []string{"id_ed25519", "id_ed25519-cert.pub"} {
+		if _, err := os.Stat(filepath.Join(agent, file)); err != nil {
+			t.Errorf("pinned agent lost %s: %v", file, err)
+		}
+	}
+}
+
+// agentName waits for the harness to write its AGENT_SSH_NAME to path.
+func agentName(t *testing.T, s *testSession, path string) string {
+	t.Helper()
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if raw, err := os.ReadFile(path); err == nil && strings.HasSuffix(string(raw), "\n") {
+			return strings.TrimSpace(string(raw))
+		}
+		if time.Now().After(deadline) {
+			s.launcher.Process.Kill()
+			t.Fatal("the harness never wrote its name")
+		}
+	}
+}
+
+// Without a pinned name, the session draws one of its own and reserves it
+// before the harness starts; a nested run, sharing the session or starting
+// one of its own with the name it inherits, uses that name and removes
+// nothing; the session's end removes the agent's key and certificate.
+func TestSessionRemovesTheAgentItNamed(t *testing.T) {
+	signal := t.TempDir()
+	named := filepath.Join(signal, "name")
+	c := config.Config{SessionHours: 1, SSH: true}
+	dir := t.TempDir()
+	raw, _ := json.Marshal(c)
+	configPath := filepath.Join(dir, "nested.json")
+	if err := os.WriteFile(configPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	shared, _ := json.Marshal([]string{"run", "--", "/bin/sh", "-c", `echo "shared $AGENT_SSH_NAME"`})
+	own, _ := json.Marshal([]string{"--config", configPath, "run", "--", "/bin/sh", "-c", `echo "own $AGENT_SSH_NAME"`})
+	script := `echo "$AGENT_SSH_NAME" >` + shellQuote(named) + `
+agent="$XDG_STATE_HOME/geas/agents/$AGENT_SSH_NAME"
+test -f "$agent/session.json" && echo reserved
+until grep -qs ready "$GEAS_SESSION_DIR/markers/ssh"; do sleep 0.05; done
+GEAS_TEST_ARGS=` + shellQuote(string(shared)) + ` "$GEAS_TEST_BINARY"
+GEAS_SESSION_DIR= GEAS_TEST_ARGS=` + shellQuote(string(own)) + ` "$GEAS_TEST_BINARY"
+test -f "$agent/id_ed25519" && echo kept`
+	s := launchConfig(t, c, script, "AGENT_SSH_NAME=")
+	name := agentName(t, s, named)
+	if !regexp.MustCompile(`^sh-[a-z0-9-]+-[0-9a-hjkmnp-tv-z]{8}$`).MatchString(name) {
+		t.Fatalf("agent name %q", name)
+	}
+	agent := filepath.Join(s.state, "geas", "agents", name)
+	testutil.SSHCertificate(t, agent, "-5m:+2h", "host:transcoder")
+	s.wait(t)
+	output, _ := io.ReadAll(s.output)
+	for _, want := range []string{"reserved\n", "shared " + name + "\n", "own " + name + "\n", "kept\n", "SSH agent " + name + " removed.\n"} {
+		if !strings.Contains(string(output), want) {
+			t.Errorf("output lacks %q:\n%s", want, output)
+		}
+	}
+	// Only the session that reserved the name removed it.
+	if strings.Count(string(output), " removed.") != 1 {
+		t.Errorf("removed more than once:\n%s", output)
+	}
+	if _, err := os.Lstat(agent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("agent directory left: %v", err)
+	}
+	waitReaper(t, s)
+	if left := sessions(t, s); len(left) != 0 {
+		t.Fatalf("session directories left: %v", left)
+	}
+}
+
+// SIGKILL leaves the launcher no chance to remove the agent it named: the
+// reaper does.
+func TestKilledLauncherRemovesItsAgent(t *testing.T) {
+	named := filepath.Join(t.TempDir(), "name")
+	s := launchConfig(t, config.Config{SessionHours: 1, SSH: true}, `echo "$AGENT_SSH_NAME" >`+shellQuote(named)+`; exec sleep 30`, "AGENT_SSH_NAME=")
+	name := agentName(t, s, named)
+	if raw, err := os.ReadFile(s.started); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+			t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+		}
+	}
+	agent := filepath.Join(s.state, "geas", "agents", name)
+	testutil.SSHCertificate(t, agent, "-5m:+2h", "host:transcoder")
+	if _, err := os.Stat(filepath.Join(agent, "session.json")); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); reaperPID(t, s) == 0; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no reaper")
+		}
+	}
+	if err := s.launcher.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	s.wait(t)
+	waitReaper(t, s)
+	if _, err := os.Lstat(agent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("agent directory left: %v", err)
+	}
+	log, err := os.ReadFile(filepath.Join(s.state, "geas", "reaper.log"))
+	if err != nil || !strings.Contains(string(log), " "+name+": launcher gone without revoking; revoked") {
+		t.Fatalf("reaper log: %q %v", log, err)
+	}
+	if left := sessions(t, s); len(left) != 0 {
+		t.Fatalf("session directories left: %v", left)
 	}
 }

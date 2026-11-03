@@ -16,8 +16,11 @@ The harness never waits for the network. A session starts in this order:
    directory with its gitconfig and sandbox policy, and one marker per
    provider, `pending`.
 2. **The reaper** starts, before anything revocable exists.
-3. **The harness** starts.
-4. **Every provider acquires its credential in the background**, in
+3. **Names are reserved**: with SSH, the agent's own name, recorded in the
+   ledger first, so that the session's end removes it; see
+   [Agent names](ssh.md#agent-names).
+4. **The harness** starts.
+5. **Every provider acquires its credential in the background**, in
    parallel: it writes the credential's files and its tools'
    configuration, then its marker, `ready`, or `failed` with the reason.
 

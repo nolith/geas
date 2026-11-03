@@ -1,7 +1,8 @@
-// Package session runs one session: it creates the session directory and
-// starts the revocation reaper, starts the harness with an environment that
-// reads that directory, acquires the credentials into it in the background,
-// and revokes them when the harness exits.
+// Package session runs one session: it creates the session directory,
+// starts the revocation reaper and reserves the agent's names, starts the
+// harness with an environment that reads that directory, acquires the
+// credentials into it in the background, and revokes them when the harness
+// exits.
 package session
 
 import (
@@ -161,7 +162,7 @@ func reason(err error) string {
 }
 
 // displayName is how the output names a provider kind.
-var displayName = map[string]string{"gitlab": "GitLab", "github": "GitHub"}
+var displayName = map[string]string{"gitlab": "GitLab", "github": "GitHub", sshcert.ID: "SSH agent"}
 
 // teardown revokes every unrevoked ledger entry through the provider that
 // created it, in parallel across providers. Once nothing is left it tells the
@@ -187,9 +188,12 @@ func teardown(dir *sessiondir.Dir, book *ledger.Ledger, providers []provider.Pro
 	}
 	revoked := map[string]bool{}
 	failed := map[string]bool{}
+	var removed []string
 	for _, r := range results {
 		kind := kinds[r.Entry.Provider]
 		switch {
+		case r.Err == nil && kind == sshcert.ID:
+			removed = append(removed, r.Entry.Name)
 		case r.Err == nil:
 			revoked[kind] = true
 		case errors.Is(r.Err, ledger.ErrGone):
@@ -224,6 +228,9 @@ func teardown(dir *sessiondir.Dir, book *ledger.Ledger, providers []provider.Pro
 	for _, kind := range slices.Sorted(maps.Keys(revoked)) {
 		fmt.Fprintln(output, displayName[kind]+" session PAT revoked.")
 	}
+	for _, name := range removed {
+		fmt.Fprintln(output, "SSH agent "+name+" removed.")
+	}
 }
 
 // mark records how far a provider got, for the credential helper and geas
@@ -238,7 +245,7 @@ func mark(dir *sessiondir.Dir, id, state, reason string) error {
 // GitLab without glab or with an unreadable issuer file, or SSH without the
 // agent's name, is kept for its setup and configuration, and failed lists
 // why: it never acquires anything, and the session starts all the same.
-func plan(ctx context.Context, settings config.Config, args []string, api *api.API, timer *timing.Timer) (providers []provider.Provider, failed map[string]string) {
+func plan(settings config.Config, args []string, api *api.API, timer *timing.Timer) (providers []provider.Provider, failed map[string]string) {
 	failed = map[string]string{}
 	for _, c := range settings.GitLab {
 		gl, err := gitlab.New(c, settings.Duration(), api, nil)
@@ -253,7 +260,7 @@ func plan(ctx context.Context, settings config.Config, args []string, api *api.A
 		providers = append(providers, github.New(c, api))
 	}
 	if settings.SSH {
-		ssh, err := sshcert.New(ctx, args)
+		ssh, err := sshcert.New(args)
 		if err != nil {
 			failed[ssh.ID()] = reason(err)
 		}
@@ -287,7 +294,8 @@ const ExitNotStarted = 125
 var launchReaper = startReaper
 
 // Run runs one session around args. It plans the session without a network
-// call, starts the reaper, then the harness, and only then acquires the
+// call, starts the reaper, reserves what the harness is told about, such as
+// the SSH agent's name, then starts the harness, and only then acquires the
 // providers' credentials, in parallel, in the background: the harness never
 // waits for the network. A provider that fails is marked failed and never
 // stops the session; nothing prints while the harness runs. Before the
@@ -314,7 +322,7 @@ func Run(ctx context.Context, settings config.Config, args []string, api *api.AP
 	if err != nil {
 		return ExitNotStarted, err
 	}
-	providers, failed := plan(ctx, settings, args, api, timer)
+	providers, failed := plan(settings, args, api, timer)
 	id, err := sessiondir.NewID(time.Now())
 	if err != nil {
 		return ExitNotStarted, err
@@ -324,8 +332,7 @@ func Run(ctx context.Context, settings config.Config, args []string, api *api.AP
 	if err != nil {
 		return ExitNotStarted, err
 	}
-	exported, err := providerEnv(providers, path)
-	if err != nil {
+	if _, err = providerEnv(providers, path); err != nil {
 		return ExitNotStarted, err
 	}
 	hosts, err := credhelper.Hosts(providers)
@@ -346,11 +353,6 @@ func Run(ctx context.Context, settings config.Config, args []string, api *api.AP
 		return ExitNotStarted, err
 	}
 	if err = writeSandbox(dir, providers); err != nil {
-		dir.Remove()
-		return ExitNotStarted, err
-	}
-	environment, err := sessionEnvironment(os.Environ(), dir, exported)
-	if err != nil {
 		dir.Remove()
 		return ExitNotStarted, err
 	}
@@ -391,6 +393,29 @@ func Run(ctx context.Context, settings config.Config, args []string, api *api.AP
 		return ExitNotStarted, err
 	}
 	timer.Step("reaper")
+	// With the ledger and the reaper there to remove it, each name the
+	// harness is told about is reserved, and the environment that tells it
+	// is read only then.
+	for _, p := range providers {
+		r, ok := p.(provider.Reserver)
+		if !ok || failed[p.ID()] != "" {
+			continue
+		}
+		if err = r.Reserve(book); err != nil {
+			failed[p.ID()] = reason(err)
+			if err = mark(dir, p.ID(), sessiondir.Failed, failed[p.ID()]); err != nil {
+				return ExitNotStarted, err
+			}
+		}
+	}
+	exported, err := providerEnv(providers, dir.Path())
+	if err != nil {
+		return ExitNotStarted, err
+	}
+	environment, err := sessionEnvironment(os.Environ(), dir, exported)
+	if err != nil {
+		return ExitNotStarted, err
+	}
 	timer.HarnessStart()
 	command := args
 	if settings.Wrapper != nil {

@@ -12,6 +12,7 @@ import (
 	"github.com/nolith/geas/internal/config"
 	"github.com/nolith/geas/internal/ledger"
 	"github.com/nolith/geas/internal/sessiondir"
+	"github.com/nolith/geas/internal/sshgrant"
 	"github.com/nolith/geas/internal/testutil"
 )
 
@@ -128,6 +129,34 @@ func TestReaperRefusesAnUnknownProvider(t *testing.T) {
 		t.Fatalf("ledger: %+v %v", open, err)
 	}
 	// Kept as evidence, and for whoever can revoke it.
+	if _, err := sessiondir.Open(book.ID()); err != nil {
+		t.Fatalf("session directory: %v", err)
+	}
+}
+
+// An agent's name the reaper cannot remove stays, with the session's
+// directory, and the log says how to remove it.
+func TestReaperGivesUpOnAnAgentName(t *testing.T) {
+	pauses := reaperPauses
+	reaperPauses = []time.Duration{0, 0, 0}
+	t.Cleanup(func() { reaperPauses = pauses })
+	path, book, _ := reaperSession(t, ledger.Entry{Provider: "ssh", Name: "sh-geas-k3x9q2mz"})
+	if err := sshgrant.Reserve("sh-geas-k3x9q2mz", sshgrant.Owner{Session: book.ID(), Tool: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+	agent, _ := sshgrant.AgentDir("sh-geas-k3x9q2mz")
+	testutil.SSHCertificate(t, agent, "-5m:+2h", "host:transcoder")
+	if err := os.Chmod(agent, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(agent, 0700) })
+	if err := watch(context.Background(), strings.NewReader(""), path, book.ID()); err == nil {
+		t.Fatal("no error for a name the reaper could not remove")
+	}
+	log, err := os.ReadFile(reaperLogPath())
+	if err != nil || !strings.Contains(string(log), " sh-geas-k3x9q2mz: giving up; remove the session directory, then run geas ssh drop sh-geas-k3x9q2mz\n") {
+		t.Fatalf("reaper log: %q %v", log, err)
+	}
 	if _, err := sessiondir.Open(book.ID()); err != nil {
 		t.Fatalf("session directory: %v", err)
 	}

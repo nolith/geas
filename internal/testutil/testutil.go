@@ -210,7 +210,7 @@ func Golden(t *testing.T, path string, got []byte) {
 }
 
 // Executable writes an executable script named name into a new directory at
-// the front of PATH, standing in for a tool such as ykman or herdr.
+// the front of PATH, standing in for a tool such as ykman.
 func Executable(t *testing.T, name, script string) {
 	t.Helper()
 	dir := t.TempDir()

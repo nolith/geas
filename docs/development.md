@@ -59,14 +59,20 @@ Provider APIs are simulated; tests never use real credentials.
   never stop the start while Git refuses.
 - **Sandbox**: the wrapper with its early-exit hint, the background sandbox
   check, `no_new_privs`.
-- **`geas ssh`**: agent names with and without a fake `herdr`, durations
-  and host names, the CA lists and the YubiKey picked by serial through a
-  fake `ykman`, grants end to end with a software CA standing in for the
-  YubiKey, `show` against `ssh-keygen -L`, `drop`, `enroll` with fakes, and
-  the refusals without a terminal and inside a session.
+- **`geas ssh`**: drawn and pinned agent names, `geas ssh name` inside
+  and outside a session, reservations that one session of many wins and
+  only their own session releases, durations and host names, the CA lists
+  and the YubiKey picked by serial through a fake `ykman`, grants end to
+  end with a software CA standing in for the YubiKey, `show` against
+  `ssh-keygen -L`, the list with reserved names, `drop` of a running and
+  an ended session's name, `enroll` with fakes, and the refusals without a
+  terminal and inside a session.
 - **The SSH provider**: expired, future, foreign and valid certificates,
-  its watch picking up a grant, a re-grant and a drop, and a session whose
-  harness gets a certificate granted while it runs.
+  its watch picking up a grant, a re-grant and a drop, sessions in one
+  directory drawing names of their own, a taken name replaced, a session
+  whose harness gets a certificate granted while it runs, its agent
+  removed at the end and by the reaper after SIGKILL, and pinned or
+  inherited names, nested runs among them, left alone.
 
 The golden files under `testdata/` follow what `glab` 1.123 and `gh` 2.102
 write themselves; both read them back unchanged.

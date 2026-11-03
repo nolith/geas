@@ -3,8 +3,12 @@
 // session directory, so that a sandbox need only grant that directory, and
 // writes an ssh_config that uses them. It watches the agent's directory, so
 // that a grant made while the session runs reaches the agent within seconds.
-// A certificate expires on its own, within 12 hours: there is nothing to
-// revoke.
+//
+// Each session reserves a name of its own for its agent before the harness
+// starts, recorded in the ledger, and revoking that entry removes the
+// agent's directory, its key and certificate: a certificate expires on its
+// own, within 12 hours, but nothing is left to use it. A name the human
+// pinned is the human's, and stays.
 package sshcert
 
 import (
@@ -20,6 +24,7 @@ import (
 	"github.com/nolith/geas/internal/ledger"
 	"github.com/nolith/geas/internal/provider"
 	"github.com/nolith/geas/internal/secretfile"
+	"github.com/nolith/geas/internal/sessiondir"
 	"github.com/nolith/geas/internal/sshgrant"
 	"github.com/nolith/geas/internal/timing"
 )
@@ -31,10 +36,21 @@ const ID = "ssh"
 // three files, cheap enough to run every few seconds for a whole session.
 const pollInterval = 3 * time.Second
 
+// reserveAttempts is how many new names Reserve draws before it gives up:
+// with 40 random bits, a second is already as unlikely as can be.
+const reserveAttempts = 5
+
 // Provider is the agent's certificate, for one session.
 type Provider struct {
-	// Name is the agent's name; empty when New could not find it.
+	// Name is the agent's name; empty when New could not find it, or
+	// Reserve could not reserve it.
 	Name string
+	// tool and dir are what a new name is made of; reserve, whether the
+	// session reserves Name, which the human did not pin.
+	tool, dir string
+	reserve   bool
+	// session is the ID of the session whose names Revoke removes.
+	session string
 	// agents is the agents' directory, $XDG_STATE_HOME/geas/agents.
 	agents string
 	poll   time.Duration
@@ -44,13 +60,16 @@ type Provider struct {
 var (
 	_ provider.Provider = (*Provider)(nil)
 	_ provider.Watcher  = (*Provider)(nil)
+	_ provider.Reserver = (*Provider)(nil)
 )
 
-// New prepares the certificate of the agent harness runs: its name is the
-// harness's tool, the base name of its first word, and its workspace, as
-// geas ssh name finds them. When the name cannot be found, the provider is
-// returned all the same, for its Setup, with the reason.
-func New(ctx context.Context, harness []string) (*Provider, error) {
+// New prepares the certificate of the agent harness runs, whose tool is the
+// base name of its first word. When AGENT_SSH_NAME names an agent of that
+// tool, as the human may pin one, or a nested session inherits it, that is
+// the agent; otherwise the provider draws a new name, which Reserve makes
+// the session's. When there is no name, the provider is returned all the
+// same, for its Setup, with the reason.
+func New(harness []string) (*Provider, error) {
 	p := &Provider{poll: pollInterval, now: time.Now}
 	agents, err := sshgrant.AgentsDir()
 	if err != nil {
@@ -60,8 +79,23 @@ func New(ctx context.Context, harness []string) (*Provider, error) {
 	if len(harness) == 0 {
 		return p, errors.New("no harness to name the agent after")
 	}
-	p.Name, err = sshgrant.Name(ctx, filepath.Base(harness[0]))
-	return p, err
+	tool := filepath.Base(harness[0])
+	if p.Name = sshgrant.Pinned(tool); p.Name != "" {
+		return p, nil
+	}
+	// Without a working directory, the name goes without that part.
+	dir, _ := os.Getwd()
+	if p.Name, err = sshgrant.NewName(tool, dir); err != nil {
+		return p, err
+	}
+	p.tool, p.dir, p.reserve = tool, dir, true
+	return p, nil
+}
+
+// NewRevoker is the provider that revokes what session reserved, for the
+// reaper, which has nothing else to build it from.
+func NewRevoker(session string) *Provider {
+	return &Provider{session: session, poll: pollInterval, now: time.Now}
 }
 
 func (p *Provider) ID() string   { return ID }
@@ -91,8 +125,73 @@ func (p *Provider) Refresh(_ context.Context, c provider.Credential) (provider.C
 	return c, nil
 }
 
-// Revoke has nothing to do: a certificate is never in the ledger.
-func (p *Provider) Revoke(context.Context, ledger.Entry) error { return ledger.ErrGone }
+// Reserve makes the drawn name the session's, before the harness starts,
+// so that Setup exports it: each attempt is in the ledger before the
+// agent's directory is created, and a name that is taken is closed and
+// replaced by a new one. A pinned name needs nothing. When no name can be
+// reserved, the provider is left without one.
+func (p *Provider) Reserve(l *ledger.Ledger) error {
+	if !p.reserve {
+		return nil
+	}
+	// Set first: whatever an attempt cut short left, Revoke removes.
+	p.session = l.ID()
+	err := p.reserveName(l)
+	if err != nil {
+		p.Name = ""
+	}
+	return err
+}
+
+func (p *Provider) reserveName(l *ledger.Ledger) error {
+	owner := sshgrant.Owner{Session: p.session, Tool: p.tool, Dir: p.dir}
+	for attempt := 0; attempt < reserveAttempts; attempt++ {
+		if attempt > 0 {
+			name, err := sshgrant.NewName(p.tool, p.dir)
+			if err != nil {
+				return err
+			}
+			p.Name = name
+		}
+		e := ledger.Entry{Provider: ID, Name: p.Name, Created: p.now().UTC()}
+		if err := l.Record(e); err != nil {
+			return err
+		}
+		err := sshgrant.Reserve(p.Name, owner)
+		if !errors.Is(err, sshgrant.ErrTaken) {
+			return err
+		}
+		// Someone else's: nothing of it is the session's to remove.
+		e.Revoked = true
+		if err = l.Record(e); err != nil {
+			return err
+		}
+	}
+	return errors.New("no free agent name after " + fmt.Sprint(reserveAttempts) + " attempts")
+}
+
+// Revoke removes the session's copies of the key and certificate, and the
+// directory of the agent e names, once the session reserved it: a name
+// that is not the session's, or gone already, is ErrGone, and stays.
+func (p *Provider) Revoke(_ context.Context, e ledger.Entry) error {
+	if p.session == "" {
+		return ledger.ErrGone
+	}
+	if dir, err := sessiondir.Open(p.session); err == nil {
+		for _, rel := range []string{sshgrant.SessionConfig, sshgrant.SessionCertificate, sshgrant.SessionKey} {
+			if err = dir.RemoveFile(rel); err != nil {
+				return err
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	err := sshgrant.Release(e.Name, p.session)
+	if errors.Is(err, sshgrant.ErrNotOwned) {
+		return ledger.ErrGone
+	}
+	return err
+}
 
 // ask is what the agent should do about a missing or unusable certificate.
 func (p *Provider) ask() string {
