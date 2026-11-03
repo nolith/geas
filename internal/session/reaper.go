@@ -23,14 +23,14 @@ import (
 )
 
 // The reaper revokes what the session's ledger lists when the launcher no
-// longer can. A closing herdr pane follows SIGHUP and SIGTERM with SIGKILL
-// about half a second later, often before the launcher's own revocation
-// finishes, and kills the whole pane process tree. The reaper is outside that
-// tree and session, so it survives. It gets only the configuration path and
-// the session ID, starts before anything revocable exists, and waits on a pipe
-// whose write end only the launcher holds: EOF without reaperDone means the
-// launcher died, however it died, or its revocation failed. Only then does it
-// read the ledger.
+// longer can. A terminal multiplexer closing its pane or tab may follow
+// SIGHUP and SIGTERM with SIGKILL within a second, often before the
+// launcher's own revocation finishes, and kill the whole process tree under
+// it. The reaper is outside that tree and session, so it survives. It gets
+// only the configuration path and the session ID, starts before anything
+// revocable exists, and waits on a pipe whose write end only the launcher
+// holds: EOF without reaperDone means the launcher died, however it died,
+// or its revocation failed. Only then does it read the ledger.
 
 const reaperDone = "revoked\n"
 

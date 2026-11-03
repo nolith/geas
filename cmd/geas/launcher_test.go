@@ -283,8 +283,9 @@ grep -c '"bypass_protection"' "$GEAS_SANDBOX_PROFILE"
 	}
 }
 
-// SIGKILL, as from a herdr pane that closes, leaves no chance to revoke: the
-// reaper, outside the launcher's session and process tree, must do it.
+// SIGKILL, as from a multiplexer's pane that closes, leaves no chance to
+// revoke: the reaper, outside the launcher's session and process tree, must
+// do it.
 func TestKilledLauncherIsReaped(t *testing.T) {
 	s := startSession(t, "exec sleep 30")
 	waitSettled(t, s)
